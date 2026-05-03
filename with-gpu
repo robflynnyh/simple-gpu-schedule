@@ -2,7 +2,7 @@
 """Tiny cooperative FIFO GPU scheduler.
 
 Usage:
-  with-gpu <pool> [--num N] [--queue-dir DIR] [--interval SECONDS] -- <cmd> [args...]
+  with-gpu <pool> [--num N] [--idle-seconds SECONDS] [--queue-dir DIR] -- <cmd> [args...]
 
 Pools:
   any       any visible GPU
@@ -14,6 +14,10 @@ Examples:
   with-gpu any -- python train.py
   with-gpu any --num 2 -- torchrun --nproc_per_node=2 train.py
   with-gpu 0-3 --num 2 -- bash launch.sh
+
+By default a GPU must be free of compute processes continuously for 120 seconds
+before it is considered available. Override with --idle-seconds or
+GPU_IDLE_SECONDS.
 """
 from __future__ import annotations
 
@@ -242,8 +246,24 @@ def remove_stale_tickets(tickets: list[dict[str, Any]], current_boot_id: str) ->
     return live
 
 
-def externally_free_indices(gpus: list[dict[str, Any]]) -> list[int]:
-    return [gpu["index"] for gpu in gpus if not gpu["pids"]]
+def externally_free_indices(gpus: list[dict[str, Any]], idle_since: dict[int, float], idle_seconds: int) -> list[int]:
+    now = time.monotonic()
+    available = []
+    for gpu in gpus:
+        idx = gpu["index"]
+        if gpu["pids"]:
+            idle_since.pop(idx, None)
+            continue
+        idle_since.setdefault(idx, now)
+        if now - idle_since[idx] >= idle_seconds:
+            available.append(idx)
+    return available
+
+
+def idle_remaining(idx: int, idle_since: dict[int, float], idle_seconds: int) -> int:
+    if idx not in idle_since:
+        return idle_seconds
+    return max(0, int(idle_seconds - (time.monotonic() - idle_since[idx])))
 
 
 def try_plan_for_ticket(ticket: dict[str, Any], available: list[int]) -> list[int] | None:
@@ -306,7 +326,7 @@ def render_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(out)
 
 
-def render_status(ticket: dict[str, Any], tickets: list[dict[str, Any]], gpus: list[dict[str, Any]], selected: list[int] | None, interval: int) -> str:
+def render_status(ticket: dict[str, Any], tickets: list[dict[str, Any]], gpus: list[dict[str, Any]], selected: list[int] | None, interval: int, idle_since: dict[int, float], idle_seconds: int) -> str:
     ticket_rows = []
     for pos, t in enumerate(tickets[:12], start=1):
         marker = "← you" if t["id"] == ticket["id"] else ""
@@ -329,7 +349,8 @@ def render_status(ticket: dict[str, Any], tickets: list[dict[str, Any]], gpus: l
             who = f"{proc['user']}:{proc['pid']}"
             cmd = truncate(proc.get("cmd") or proc.get("process", ""), 34)
         else:
-            state = "FREE"
+            rem = idle_remaining(gpu["index"], idle_since, idle_seconds)
+            state = "FREE" if rem == 0 else f"IDLE {rem}s"
             who = ""
             cmd = ""
         gpu_rows.append([
@@ -351,7 +372,7 @@ def render_status(ticket: dict[str, Any], tickets: list[dict[str, Any]], gpus: l
         "GPUs:",
         render_table(["GPU", "State", "Memory", "Util", "User:PID", "Command"], gpu_rows),
         "",
-        f"Waiting... next check in {interval}s. Ctrl-C removes your ticket.",
+        f"Waiting... next check in {interval}s. Idle grace: {idle_seconds}s. Ctrl-C removes your ticket.",
     ])
 
 
@@ -377,11 +398,14 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("pool", help="GPU pool: any, 2, 0-3, or 0,2,3")
     parser.add_argument("--num", type=int, default=1, help="number of GPUs required from the pool")
     parser.add_argument("--queue-dir", default=os.environ.get("GPU_QUEUE_DIR", DEFAULT_QUEUE_DIR))
-    parser.add_argument("--interval", type=int, default=int(os.environ.get("CHECK_INTERVAL_SECONDS", "30")))
+    parser.add_argument("--interval", type=int, default=int(os.environ.get("CHECK_INTERVAL_SECONDS", "15")))
+    parser.add_argument("--idle-seconds", type=int, default=int(os.environ.get("GPU_IDLE_SECONDS", "120")), help="continuous idle time required before launch")
     args = parser.parse_args(sched_args)
     args.cmd = cmd
     if args.num < 1:
         parser.error("--num must be >= 1")
+    if args.idle_seconds < 0:
+        parser.error("--idle-seconds must be >= 0")
     return args
 
 
@@ -432,12 +456,13 @@ def main() -> int:
 
     tty = sys.stderr.isatty()
     selected: list[int] | None = None
+    idle_since: dict[int, float] = {}
     while True:
         qfd = lock_file(qlock_path)
         try:
             tickets = remove_stale_tickets(load_tickets(paths), boot_id())
             gpus = gpu_inventory()
-            available = externally_free_indices(gpus)
+            available = externally_free_indices(gpus, idle_since, args.idle_seconds)
             plan = fifo_plan(tickets, available)
             selected = plan.get(my_ticket["id"])
             if selected is not None:
@@ -445,7 +470,7 @@ def main() -> int:
                 if fds is not None:
                     # Re-check non-cooperative users after taking cooperative locks.
                     gpus = gpu_inventory()
-                    available = externally_free_indices(gpus)
+                    available = externally_free_indices(gpus, idle_since, args.idle_seconds)
                     if all(idx in available for idx in selected):
                         gpu_lock_fds.extend(fds)
                         ticket_path(paths, my_ticket["id"]).unlink(missing_ok=True)
@@ -460,7 +485,7 @@ def main() -> int:
         finally:
             unlock_fd(qfd)
 
-        print_status(render_status(my_ticket, tickets, gpus, selected, args.interval), tty)
+        print_status(render_status(my_ticket, tickets, gpus, selected, args.interval, idle_since, args.idle_seconds), tty)
         time.sleep(args.interval)
 
     if tty:

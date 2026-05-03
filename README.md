@@ -19,6 +19,7 @@ Examples:
 ./with-gpu any --num 2 -- torchrun --nproc_per_node=2 train.py
 ./with-gpu 0-3 --num 2 -- bash launch.sh
 ./with-gpu 0,2,3 --num 2 -- python train.py
+./with-gpu any --idle-seconds 0 -- python quick_test.py
 ```
 
 Pool syntax:
@@ -29,6 +30,10 @@ Pool syntax:
 - `0,2,3` — GPUs 0,2,3
 
 `--num` is the number of GPUs required from the pool, default `1`.
+
+`--idle-seconds` is the continuous time a GPU must have no `nvidia-smi` compute
+processes before launch. Default: `120`, override with `GPU_IDLE_SECONDS`.
+This avoids launching into short gaps between runs in manual shell-loop sweeps.
 
 When GPUs are acquired, `CUDA_VISIBLE_DEVICES` is set to the selected GPU list,
 e.g. `2` or `0,1`.
@@ -65,7 +70,8 @@ creation order. If the first waiting ticket cannot currently run, later tickets 
 not jump ahead.
 
 This is cooperative: jobs launched outside `with-gpu` are detected via
-`nvidia-smi` and will block launch, but they do not have queue tickets.
+`nvidia-smi` and will block launch, but they do not have queue tickets. GPUs must
+remain externally idle for the configured grace period before launch.
 
 ## Stale tickets
 
