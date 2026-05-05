@@ -83,8 +83,9 @@ Layout:
 ## FIFO behavior
 
 Waiting processes create ticket files and poll. The scheduler plans jobs in ticket
-creation order. If the first waiting ticket cannot currently run, later tickets do
-not jump ahead.
+creation order within each competing GPU pool. If an earlier ticket cannot
+currently run, it reserves the free GPUs it could use, so later overlapping
+tickets do not jump ahead. Later tickets for disjoint GPUs can still run.
 
 This is cooperative: jobs launched outside `with-gpu` are detected via
 `nvidia-smi` and will block launch, but they do not have queue tickets. GPUs must

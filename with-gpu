@@ -378,12 +378,20 @@ def try_plan_for_ticket(ticket: dict[str, Any], available: list[int]) -> list[in
 
 def fifo_plan(tickets: list[dict[str, Any]], available: list[int]) -> dict[str, list[int]]:
     remaining = list(available)
+    blocked_claims: set[int] = set()
     plan = {}
     for ticket in tickets:
-        chosen = try_plan_for_ticket(ticket, remaining)
-        if chosen is None:
-            # Strict-ish FIFO: stop at the first ticket that cannot currently run.
-            break
+        pool_remaining = [idx for idx in ticket["pool_indices"] if idx in remaining]
+        usable = [idx for idx in pool_remaining if idx not in blocked_claims]
+        needed = int(ticket["num"])
+        if len(usable) < needed:
+            # Pool-aware FIFO: an earlier blocked ticket only reserves GPUs it
+            # could actually consume from the currently free set. Later tickets
+            # may still use disjoint GPUs, but cannot jump ahead by taking one
+            # of these claimed GPUs.
+            blocked_claims.update(pool_remaining)
+            continue
+        chosen = usable[:needed]
         plan[ticket["id"]] = chosen
         remaining = [idx for idx in remaining if idx not in chosen]
     return plan
