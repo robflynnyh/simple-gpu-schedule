@@ -103,3 +103,7 @@ This does **not** resurrect jobs after reboot/disconnect. Run inside `tmux` or
 While waiting on a TTY, `with-gpu` redraws an ASCII queue/GPU dashboard. Once a
 GPU is acquired, the dashboard stops and the command output is shown normally.
 For non-TTY logs, it prints compact periodic status lines.
+
+Queue dashboard:
+
+![with-gpu queue dashboard](GPUqueue.png)
