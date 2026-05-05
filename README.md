@@ -22,6 +22,13 @@ Examples:
 ./with-gpu any --idle-seconds 0 -- python quick_test.py
 ```
 
+Install `with-gpu` into your shell PATH:
+
+```bash
+./with-gpu --add-to-bashrc
+source ~/.bashrc
+```
+
 Pool syntax:
 
 - `any` — any visible GPU
@@ -35,6 +42,9 @@ Pool syntax:
 processes before launch. Default: `120`, override with `GPU_IDLE_SECONDS`.
 This avoids launching into short gaps between runs in manual shell-loop sweeps.
 
+`--interval` is the queue polling interval while waiting. Default: `15`,
+override with `CHECK_INTERVAL_SECONDS`.
+
 When GPUs are acquired, `CUDA_VISIBLE_DEVICES` is set to the selected GPU list,
 e.g. `2` or `0,1`.
 
@@ -43,10 +53,17 @@ e.g. `2` or `0,1`.
 Default queue directory:
 
 ```text
-/exp/exp4/gpu-queue
+/store/store5/software/gpu-queue
 ```
 
-Override with:
+The executable also loads a repo-local `.env` file if present. This file is
+ignored by git and is the preferred place to set machine-local queue state:
+
+```bash
+cp .env.example .env
+```
+
+Override the queue location with:
 
 ```bash
 GPU_QUEUE_DIR=/some/shared/path ./with-gpu any -- python train.py
@@ -57,7 +74,7 @@ GPU_QUEUE_DIR=/some/shared/path ./with-gpu any -- python train.py
 Layout:
 
 ```text
-/exp/exp4/gpu-queue/
+/store/store5/software/gpu-queue/
   tickets/   waiting job tickets as JSON
   running/   running job metadata as JSON
   locks/     queue.lock and gpuN.lock flock files
@@ -86,3 +103,7 @@ This does **not** resurrect jobs after reboot/disconnect. Run inside `tmux` or
 While waiting on a TTY, `with-gpu` redraws an ASCII queue/GPU dashboard. Once a
 GPU is acquired, the dashboard stops and the command output is shown normally.
 For non-TTY logs, it prints compact periodic status lines.
+
+Queue dashboard:
+
+![with-gpu queue dashboard](GPUqueue.png)
