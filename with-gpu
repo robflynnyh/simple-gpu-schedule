@@ -36,12 +36,31 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-DEFAULT_QUEUE_DIR = "/exp/exp4/gpu-queue"
+REPO_DIR = Path(__file__).resolve().parent
+LOCAL_ENV_FILE = REPO_DIR / ".env"
+DEFAULT_QUEUE_DIR = "/store/store5/software/gpu-queue"
 # Queue state is meant to be shared by users in the same Unix group. The setgid
 # bit on directories keeps new ticket/lock files in that group even when
 # different users launch jobs from different shells.
 QUEUE_DIR_MODE = 0o2775
 STATE_FILE_MODE = 0o664
+
+
+def load_local_env(path: Path = LOCAL_ENV_FILE) -> None:
+    """Load simple KEY=VALUE defaults from the repo-local ignored env file."""
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
 
 
 def utc_now() -> str:
@@ -416,6 +435,7 @@ def print_status(text: str, tty: bool) -> None:
 
 
 def parse_cli(argv: list[str]) -> argparse.Namespace:
+    load_local_env()
     # Commands after "--" belong to the user command, not argparse. Help is the
     # only scheduler-only invocation that should be accepted without "--".
     wants_help = any(arg in ("-h", "--help") for arg in argv)

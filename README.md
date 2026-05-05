@@ -46,10 +46,17 @@ e.g. `2` or `0,1`.
 Default queue directory:
 
 ```text
-/exp/exp4/gpu-queue
+/store/store5/software/gpu-queue
 ```
 
-Override with:
+The executable also loads a repo-local `.env` file if present. This file is
+ignored by git and is the preferred place to set machine-local queue state:
+
+```bash
+cp .env.example .env
+```
+
+Override the queue location with:
 
 ```bash
 GPU_QUEUE_DIR=/some/shared/path ./with-gpu any -- python train.py
@@ -60,7 +67,7 @@ GPU_QUEUE_DIR=/some/shared/path ./with-gpu any -- python train.py
 Layout:
 
 ```text
-/exp/exp4/gpu-queue/
+/store/store5/software/gpu-queue/
   tickets/   waiting job tickets as JSON
   running/   running job metadata as JSON
   locks/     queue.lock and gpuN.lock flock files
