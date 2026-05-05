@@ -35,6 +35,9 @@ Pool syntax:
 processes before launch. Default: `120`, override with `GPU_IDLE_SECONDS`.
 This avoids launching into short gaps between runs in manual shell-loop sweeps.
 
+`--interval` is the queue polling interval while waiting. Default: `15`,
+override with `CHECK_INTERVAL_SECONDS`.
+
 When GPUs are acquired, `CUDA_VISIBLE_DEVICES` is set to the selected GPU list,
 e.g. `2` or `0,1`.
 

@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_QUEUE_DIR = "/exp/exp4/gpu-queue"
+QUEUE_DIR_MODE = 0o2775
+STATE_FILE_MODE = 0o664
 
 
 def utc_now() -> str:
@@ -147,18 +149,38 @@ def parse_pool(pool: str, all_indices: list[int]) -> list[int]:
 
 def ensure_dirs(queue_dir: Path) -> dict[str, Path]:
     paths = {
+        "queue": queue_dir,
         "tickets": queue_dir / "tickets",
         "running": queue_dir / "running",
         "locks": queue_dir / "locks",
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
+        chmod_best_effort(path, QUEUE_DIR_MODE)
+    for state_dir in (paths["tickets"], paths["running"], paths["locks"]):
+        for path in state_dir.glob("*"):
+            if path.is_file():
+                chmod_best_effort(path, STATE_FILE_MODE)
     return paths
+
+
+def chmod_best_effort(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except PermissionError:
+        pass
+
+
+def write_state_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2) + "\n")
+    chmod_best_effort(path, STATE_FILE_MODE)
 
 
 def lock_file(path: Path, blocking: bool = True):
     path.parent.mkdir(parents=True, exist_ok=True)
+    chmod_best_effort(path.parent, QUEUE_DIR_MODE)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o664)
+    chmod_best_effort(path, STATE_FILE_MODE)
     flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
     try:
         fcntl.flock(fd, flags)
@@ -199,7 +221,7 @@ def create_ticket(paths: dict[str, Path], pool: str, pool_indices: list[int], nu
         "num": num,
         "cmd": cmd,
     }
-    ticket_path(paths, ticket_id).write_text(json.dumps(ticket, indent=2) + "\n")
+    write_state_json(ticket_path(paths, ticket_id), ticket)
     return ticket
 
 
@@ -386,13 +408,16 @@ def print_status(text: str, tty: bool) -> None:
 
 
 def parse_cli(argv: list[str]) -> argparse.Namespace:
-    if "--" not in argv:
+    wants_help = any(arg in ("-h", "--help") for arg in argv)
+    if "--" not in argv and not wants_help:
         raise SystemExit("missing command separator; use: with-gpu <pool> [--num N] -- <command>")
-    sep = argv.index("--")
-    sched_args = argv[:sep]
-    cmd = argv[sep + 1 :]
-    if not cmd:
-        raise SystemExit("missing command after --")
+    if "--" in argv:
+        sep = argv.index("--")
+        sched_args = argv[:sep]
+        cmd = argv[sep + 1 :]
+    else:
+        sched_args = argv
+        cmd = []
 
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("pool", help="GPU pool: any, 2, 0-3, or 0,2,3")
@@ -401,9 +426,13 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--interval", type=int, default=int(os.environ.get("CHECK_INTERVAL_SECONDS", "15")))
     parser.add_argument("--idle-seconds", type=int, default=int(os.environ.get("GPU_IDLE_SECONDS", "120")), help="continuous idle time required before launch")
     args = parser.parse_args(sched_args)
+    if not cmd:
+        parser.error("missing command after --")
     args.cmd = cmd
     if args.num < 1:
         parser.error("--num must be >= 1")
+    if args.interval < 1:
+        parser.error("--interval must be >= 1")
     if args.idle_seconds < 0:
         parser.error("--idle-seconds must be >= 0")
     return args
@@ -434,19 +463,37 @@ def main() -> int:
     my_ticket: dict[str, Any] | None = None
     gpu_lock_fds: list[int] = []
     running_meta: Path | None = None
+    child_proc: subprocess.Popen[bytes] | None = None
+    cleaned_up = False
 
-    def cleanup(signum: int | None = None, frame: Any | None = None) -> None:
+    def cleanup() -> None:
+        nonlocal cleaned_up, running_meta
+        if cleaned_up:
+            return
+        cleaned_up = True
         if my_ticket is not None:
             ticket_path(paths, my_ticket["id"]).unlink(missing_ok=True)
         if running_meta is not None:
             running_meta.unlink(missing_ok=True)
-        for fd in gpu_lock_fds:
-            unlock_fd(fd)
-        if signum is not None:
-            raise SystemExit(128 + signum)
+            running_meta = None
+        while gpu_lock_fds:
+            unlock_fd(gpu_lock_fds.pop())
 
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
+    def signal_handler(signum: int, frame: Any | None = None) -> None:
+        if child_proc is not None and child_proc.poll() is None:
+            try:
+                os.killpg(child_proc.pid, signum)
+                child_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(child_proc.pid, signal.SIGKILL)
+                child_proc.wait()
+            except ProcessLookupError:
+                pass
+        cleanup()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     qfd = lock_file(qlock_path)
     try:
@@ -478,7 +525,7 @@ def main() -> int:
                         running = dict(my_ticket)
                         running["selected_gpus"] = selected
                         running["started_utc"] = utc_now()
-                        running_meta.write_text(json.dumps(running, indent=2) + "\n")
+                        write_state_json(running_meta, running)
                         break
                     for fd in fds:
                         unlock_fd(fd)
@@ -496,8 +543,12 @@ def main() -> int:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible
     try:
-        proc = subprocess.run(cmd, env=env)
-        return proc.returncode
+        child_proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+        while True:
+            returncode = child_proc.poll()
+            if returncode is not None:
+                return returncode
+            time.sleep(0.5)
     finally:
         cleanup()
 
