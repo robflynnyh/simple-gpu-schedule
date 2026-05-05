@@ -22,6 +22,13 @@ Examples:
 ./with-gpu any --idle-seconds 0 -- python quick_test.py
 ```
 
+Install `with-gpu` into your shell PATH:
+
+```bash
+./with-gpu --add-to-bashrc
+source ~/.bashrc
+```
+
 Pool syntax:
 
 - `any` — any visible GPU

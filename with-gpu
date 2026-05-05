@@ -3,6 +3,7 @@
 
 Usage:
   with-gpu <pool> [--num N] [--idle-seconds SECONDS] [--queue-dir DIR] -- <cmd> [args...]
+  with-gpu --add-to-bashrc
 
 Pools:
   any       any visible GPU
@@ -39,6 +40,8 @@ from typing import Any
 REPO_DIR = Path(__file__).resolve().parent
 LOCAL_ENV_FILE = REPO_DIR / ".env"
 DEFAULT_QUEUE_DIR = "/store/store5/software/gpu-queue"
+BASHRC_MARKER_BEGIN = "# >>> simple-gpu-schedule with-gpu >>>"
+BASHRC_MARKER_END = "# <<< simple-gpu-schedule with-gpu <<<"
 # Queue state is meant to be shared by users in the same Unix group. The setgid
 # bit on directories keeps new ticket/lock files in that group even when
 # different users launch jobs from different shells.
@@ -61,6 +64,57 @@ def load_local_env(path: Path = LOCAL_ENV_FILE) -> None:
         value = value.strip().strip("'\"")
         if key:
             os.environ.setdefault(key, value)
+
+
+def bashrc_snippet() -> str:
+    return "\n".join([
+        BASHRC_MARKER_BEGIN,
+        "# Added by with-gpu --add-to-bashrc",
+        f'export PATH="{REPO_DIR}:$PATH"',
+        BASHRC_MARKER_END,
+        "",
+    ])
+
+
+def render_bashrc_with_snippet(before: str, snippet: str, after: str = "") -> str:
+    before = before.rstrip()
+    after = after.lstrip("\n")
+    if before and after:
+        return before + "\n\n" + snippet + after
+    if before:
+        return before + "\n\n" + snippet
+    return snippet + after
+
+
+def add_to_bashrc(bashrc: Path | None = None) -> int:
+    bashrc = bashrc or Path.home() / ".bashrc"
+    try:
+        content = bashrc.read_text()
+    except FileNotFoundError:
+        content = ""
+
+    snippet = bashrc_snippet()
+    repo_dir = str(REPO_DIR)
+
+    if BASHRC_MARKER_BEGIN in content and BASHRC_MARKER_END in content:
+        before, marker_and_after = content.split(BASHRC_MARKER_BEGIN, 1)
+        _, after = marker_and_after.split(BASHRC_MARKER_END, 1)
+        new_content = render_bashrc_with_snippet(before, snippet, after)
+        if new_content == content:
+            print(f"with-gpu: already configured in {bashrc}")
+            return 0
+        bashrc.write_text(new_content)
+        print(f"with-gpu: updated existing bashrc entry in {bashrc}")
+        return 0
+
+    if repo_dir in content:
+        print(f"with-gpu: {repo_dir} is already referenced in {bashrc}")
+        return 0
+
+    bashrc.write_text(render_bashrc_with_snippet(content, snippet))
+    print(f"with-gpu: added {repo_dir} to PATH in {bashrc}")
+    print("with-gpu: run `source ~/.bashrc` or open a new shell to use it everywhere")
+    return 0
 
 
 def utc_now() -> str:
@@ -436,6 +490,9 @@ def print_status(text: str, tty: bool) -> None:
 
 def parse_cli(argv: list[str]) -> argparse.Namespace:
     load_local_env()
+    if argv == ["--add-to-bashrc"]:
+        args = argparse.Namespace(add_to_bashrc=True)
+        return args
     # Commands after "--" belong to the user command, not argparse. Help is the
     # only scheduler-only invocation that should be accepted without "--".
     wants_help = any(arg in ("-h", "--help") for arg in argv)
@@ -451,11 +508,13 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("pool", help="GPU pool: any, 2, 0-3, or 0,2,3")
+    parser.add_argument("--add-to-bashrc", action="store_true", help="add this checkout to PATH in ~/.bashrc and exit")
     parser.add_argument("--num", type=int, default=1, help="number of GPUs required from the pool")
     parser.add_argument("--queue-dir", default=os.environ.get("GPU_QUEUE_DIR", DEFAULT_QUEUE_DIR))
     parser.add_argument("--interval", type=int, default=int(os.environ.get("CHECK_INTERVAL_SECONDS", "15")))
     parser.add_argument("--idle-seconds", type=int, default=int(os.environ.get("GPU_IDLE_SECONDS", "120")), help="continuous idle time required before launch")
     args = parser.parse_args(sched_args)
+    args.add_to_bashrc = False
     if not cmd:
         parser.error("missing command after --")
     args.cmd = cmd
@@ -470,6 +529,9 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_cli(sys.argv[1:])
+    if args.add_to_bashrc:
+        return add_to_bashrc()
+
     cmd = args.cmd
 
     try:
