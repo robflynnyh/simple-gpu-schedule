@@ -37,6 +37,9 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_QUEUE_DIR = "/exp/exp4/gpu-queue"
+# Queue state is meant to be shared by users in the same Unix group. The setgid
+# bit on directories keeps new ticket/lock files in that group even when
+# different users launch jobs from different shells.
 QUEUE_DIR_MODE = 0o2775
 STATE_FILE_MODE = 0o664
 
@@ -157,6 +160,9 @@ def ensure_dirs(queue_dir: Path) -> dict[str, Path]:
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
         chmod_best_effort(path, QUEUE_DIR_MODE)
+    # Normalize existing state as well as new state. This lets a newer
+    # with-gpu invocation repair queue files created by an older version that
+    # honored a restrictive umask.
     for state_dir in (paths["tickets"], paths["running"], paths["locks"]):
         for path in state_dir.glob("*"):
             if path.is_file():
@@ -165,6 +171,8 @@ def ensure_dirs(queue_dir: Path) -> dict[str, Path]:
 
 
 def chmod_best_effort(path: Path, mode: int) -> None:
+    # chmod can fail when a user touches a queue created by someone else. The
+    # scheduler should still run if the existing permissions are already usable.
     try:
         path.chmod(mode)
     except PermissionError:
@@ -408,6 +416,8 @@ def print_status(text: str, tty: bool) -> None:
 
 
 def parse_cli(argv: list[str]) -> argparse.Namespace:
+    # Commands after "--" belong to the user command, not argparse. Help is the
+    # only scheduler-only invocation that should be accepted without "--".
     wants_help = any(arg in ("-h", "--help") for arg in argv)
     if "--" not in argv and not wants_help:
         raise SystemExit("missing command separator; use: with-gpu <pool> [--num N] -- <command>")
@@ -468,6 +478,9 @@ def main() -> int:
 
     def cleanup() -> None:
         nonlocal cleaned_up, running_meta
+        # Signal paths and normal completion can both arrive at cleanup. Make it
+        # idempotent so the same ticket, metadata file, or fd is not removed
+        # twice after a child exits during shutdown.
         if cleaned_up:
             return
         cleaned_up = True
@@ -482,6 +495,9 @@ def main() -> int:
     def signal_handler(signum: int, frame: Any | None = None) -> None:
         if child_proc is not None and child_proc.poll() is None:
             try:
+                # The wrapped command may be a shell that starts its own
+                # children. Signal the whole process group so descendants do not
+                # keep running after the scheduler has released its GPU lock.
                 os.killpg(child_proc.pid, signum)
                 child_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -543,7 +559,11 @@ def main() -> int:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = cuda_visible
     try:
+        # Put the command in a new session so child_proc.pid is also the process
+        # group id used by signal_handler above.
         child_proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+        # Poll instead of blocking indefinitely in wait(); this keeps Python
+        # signal handling responsive while the wrapped command is running.
         while True:
             returncode = child_proc.poll()
             if returncode is not None:
