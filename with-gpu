@@ -3,10 +3,11 @@
 
 Usage:
   with-gpu <pool> [--num N] [--idle-seconds SECONDS] [--queue-dir DIR] -- <cmd> [args...]
+  with-gpu [<pool>] [--num N] [--queue-dir DIR] --status
   with-gpu --add-to-bashrc
 
 Pools:
-  any       any visible GPU
+  any/all   any visible GPU
   2         only GPU 2
   0-3       GPUs 0,1,2,3
   0,2,3     GPUs 0,2,3
@@ -16,7 +17,7 @@ Examples:
   with-gpu any --num 2 -- torchrun --nproc_per_node=2 train.py
   with-gpu 0-3 --num 2 -- bash launch.sh
 
-By default a GPU must be free of compute processes continuously for 120 seconds
+By default a GPU must be free of compute processes continuously for 30 seconds
 before it is considered available. Override with --idle-seconds or
 GPU_IDLE_SECONDS.
 """
@@ -40,6 +41,7 @@ from typing import Any
 REPO_DIR = Path(__file__).resolve().parent
 LOCAL_ENV_FILE = REPO_DIR / ".env"
 DEFAULT_QUEUE_DIR = "/store/store5/software/gpu-queue"
+DEFAULT_IDLE_SECONDS = 30
 BASHRC_MARKER_BEGIN = "# >>> simple-gpu-schedule with-gpu >>>"
 BASHRC_MARKER_END = "# <<< simple-gpu-schedule with-gpu <<<"
 # Queue state is meant to be shared by users in the same Unix group. The setgid
@@ -195,7 +197,7 @@ def process_info(pid: str) -> tuple[str, str]:
 
 
 def parse_pool(pool: str, all_indices: list[int]) -> list[int]:
-    if pool == "any":
+    if pool in ("any", "all"):
         return list(all_indices)
     indices: list[int] = []
     for part in pool.split(","):
@@ -223,13 +225,17 @@ def parse_pool(pool: str, all_indices: list[int]) -> list[int]:
     return deduped
 
 
-def ensure_dirs(queue_dir: Path) -> dict[str, Path]:
-    paths = {
+def queue_paths(queue_dir: Path) -> dict[str, Path]:
+    return {
         "queue": queue_dir,
         "tickets": queue_dir / "tickets",
         "running": queue_dir / "running",
         "locks": queue_dir / "locks",
     }
+
+
+def ensure_dirs(queue_dir: Path) -> dict[str, Path]:
+    paths = queue_paths(queue_dir)
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
         chmod_best_effort(path, QUEUE_DIR_MODE)
@@ -317,6 +323,19 @@ def load_tickets(paths: dict[str, Path]) -> list[dict[str, Any]]:
             continue
     tickets.sort(key=lambda t: (t.get("created_ns", 0), t.get("id", "")))
     return tickets
+
+
+def load_running(paths: dict[str, Path]) -> list[dict[str, Any]]:
+    running = []
+    for path in paths["running"].glob("*.json"):
+        try:
+            meta = json.loads(path.read_text())
+            meta["_path"] = str(path)
+            running.append(meta)
+        except Exception:
+            continue
+    running.sort(key=lambda r: (r.get("created_ns", 0), r.get("id", "")))
+    return running
 
 
 def pid_alive(pid: int) -> bool:
@@ -487,6 +506,69 @@ def render_status(ticket: dict[str, Any], tickets: list[dict[str, Any]], gpus: l
     ])
 
 
+def render_queue_check(paths: dict[str, Path], pool: str, num: int, tickets: list[dict[str, Any]], running: list[dict[str, Any]], gpus: list[dict[str, Any]]) -> str:
+    ticket_rows = []
+    for pos, t in enumerate(tickets[:20], start=1):
+        cmd = " ".join(t.get("cmd", []))
+        ticket_rows.append([
+            str(pos),
+            t.get("id", "?").split("-")[-1],
+            t.get("pool", "?"),
+            str(t.get("num", "?")),
+            t.get("user", "?"),
+            fmt_age(int(t.get("created_ns", 0))),
+            truncate(cmd, 48),
+        ])
+
+    running_rows = []
+    for item in running[:20]:
+        cmd = " ".join(item.get("cmd", []))
+        selected = ",".join(map(str, item.get("selected_gpus", []))) or "?"
+        running_rows.append([
+            item.get("id", "?").split("-")[-1],
+            selected,
+            item.get("user", "?"),
+            item.get("started_utc", "?"),
+            truncate(cmd, 48),
+        ])
+
+    gpu_rows = []
+    for gpu in gpus:
+        if gpu["pids"]:
+            proc = gpu["pids"][0]
+            state = "BUSY"
+            who = f"{proc['user']}:{proc['pid']}"
+            cmd = truncate(proc.get("cmd") or proc.get("process", ""), 40)
+        else:
+            state = "FREE NOW"
+            who = ""
+            cmd = ""
+        gpu_rows.append([
+            str(gpu["index"]),
+            state,
+            f"{gpu['mem_used']}/{gpu['mem_total']} MiB",
+            f"{gpu['util']}%",
+            who,
+            cmd,
+        ])
+
+    return "\n".join([
+        f"GPU QUEUE CHECK — {socket.gethostname()} — {utc_now()}",
+        f"Queue dir: {paths['queue']}",
+        f"Request view: pool {pool}  num {num}",
+        "No ticket created; no command will launch.",
+        "",
+        "Waiting tickets:",
+        render_table(["Pos", "Ticket", "Pool", "Num", "User", "Wait", "Command"], ticket_rows or [["", "", "", "", "", "", ""]]),
+        "",
+        "Running jobs:",
+        render_table(["Ticket", "GPUs", "User", "Started", "Command"], running_rows or [["", "", "", "", ""]]),
+        "",
+        "GPUs:",
+        render_table(["GPU", "State", "Memory", "Util", "User:PID", "Command"], gpu_rows),
+    ])
+
+
 def print_status(text: str, tty: bool) -> None:
     if tty:
         sys.stderr.write("\033[2J\033[H" + text + "\n")
@@ -504,7 +586,8 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
     # Commands after "--" belong to the user command, not argparse. Help is the
     # only scheduler-only invocation that should be accepted without "--".
     wants_help = any(arg in ("-h", "--help") for arg in argv)
-    if "--" not in argv and not wants_help:
+    wants_status = "--status" in argv
+    if "--" not in argv and not wants_help and not wants_status:
         raise SystemExit("missing command separator; use: with-gpu <pool> [--num N] -- <command>")
     if "--" in argv:
         sep = argv.index("--")
@@ -515,15 +598,18 @@ def parse_cli(argv: list[str]) -> argparse.Namespace:
         cmd = []
 
     parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("pool", help="GPU pool: any, 2, 0-3, or 0,2,3")
+    parser.add_argument("pool", nargs="?", default="any", help="GPU pool: any/all, 2, 0-3, or 0,2,3")
     parser.add_argument("--add-to-bashrc", action="store_true", help="add this checkout to PATH in ~/.bashrc and exit")
+    parser.add_argument("--status", action="store_true", help="print queue/GPU status once without creating a ticket or launching a command")
     parser.add_argument("--num", type=int, default=1, help="number of GPUs required from the pool")
     parser.add_argument("--queue-dir", default=os.environ.get("GPU_QUEUE_DIR", DEFAULT_QUEUE_DIR))
     parser.add_argument("--interval", type=int, default=int(os.environ.get("CHECK_INTERVAL_SECONDS", "15")))
-    parser.add_argument("--idle-seconds", type=int, default=int(os.environ.get("GPU_IDLE_SECONDS", "120")), help="continuous idle time required before launch")
+    parser.add_argument("--idle-seconds", type=int, default=int(os.environ.get("GPU_IDLE_SECONDS", str(DEFAULT_IDLE_SECONDS))), help="continuous idle time required before launch")
     args = parser.parse_args(sched_args)
     args.add_to_bashrc = False
-    if not cmd:
+    if args.status and cmd:
+        parser.error("--status does not accept a command")
+    if not args.status and not cmd:
         parser.error("missing command after --")
     args.cmd = cmd
     if args.num < 1:
@@ -558,6 +644,11 @@ def main() -> int:
         return 2
 
     queue_dir = Path(args.queue_dir)
+    if args.status:
+        paths = queue_paths(queue_dir)
+        print(render_queue_check(paths, args.pool, args.num, load_tickets(paths), load_running(paths), gpus))
+        return 0
+
     paths = ensure_dirs(queue_dir)
     qlock_path = paths["locks"] / "queue.lock"
     my_ticket: dict[str, Any] | None = None

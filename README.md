@@ -20,6 +20,9 @@ Examples:
 ./with-gpu 0-3 --num 2 -- bash launch.sh
 ./with-gpu 0,2,3 --num 2 -- python train.py
 ./with-gpu any --idle-seconds 0 -- python quick_test.py
+./with-gpu --status
+./with-gpu all --status
+./with-gpu 1,2 --status
 ```
 
 Install `with-gpu` into your shell PATH:
@@ -31,7 +34,7 @@ source ~/.bashrc
 
 Pool syntax:
 
-- `any` — any visible GPU
+- `any` or `all` — any visible GPU
 - `2` — only GPU 2
 - `0-3` — GPUs 0,1,2,3
 - `0,2,3` — GPUs 0,2,3
@@ -39,7 +42,7 @@ Pool syntax:
 `--num` is the number of GPUs required from the pool, default `1`.
 
 `--idle-seconds` is the continuous time a GPU must have no `nvidia-smi` compute
-processes before launch. Default: `120`, override with `GPU_IDLE_SECONDS`.
+processes before launch. Default: `30`, override with `GPU_IDLE_SECONDS`.
 This avoids launching into short gaps between runs in manual shell-loop sweeps.
 
 `--interval` is the queue polling interval while waiting. Default: `15`,
@@ -47,6 +50,9 @@ override with `CHECK_INTERVAL_SECONDS`.
 
 When GPUs are acquired, `CUDA_VISIBLE_DEVICES` is set to the selected GPU list,
 e.g. `2` or `0,1`.
+
+`--status` prints the current waiting tickets, running `with-gpu` jobs, and GPU
+process state once. It does not create a ticket, wait, or launch a command.
 
 ## Queue state
 

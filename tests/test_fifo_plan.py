@@ -59,5 +59,29 @@ class FifoPlanTests(unittest.TestCase):
         self.assertEqual(WITH_GPU.fifo_plan(tickets, [2, 3]), {"gpu2_or_gpu3": [3]})
 
 
+class CliTests(unittest.TestCase):
+    def test_default_idle_seconds_is_30(self):
+        args = WITH_GPU.parse_cli(["any", "--", "true"])
+
+        self.assertEqual(args.idle_seconds, 30)
+        self.assertFalse(args.status)
+
+    def test_status_does_not_require_command(self):
+        args = WITH_GPU.parse_cli(["--status"])
+
+        self.assertTrue(args.status)
+        self.assertEqual(args.pool, "any")
+        self.assertEqual(args.cmd, [])
+
+    def test_status_accepts_pool(self):
+        args = WITH_GPU.parse_cli(["1,2", "--status"])
+
+        self.assertTrue(args.status)
+        self.assertEqual(args.pool, "1,2")
+
+    def test_all_pool_alias_matches_any(self):
+        self.assertEqual(WITH_GPU.parse_pool("all", [0, 1, 2]), [0, 1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()
