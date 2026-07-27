@@ -97,10 +97,13 @@ This is cooperative: jobs launched outside `with-gpu` are detected via
 `nvidia-smi` and will block launch, but they do not have queue tickets. GPUs must
 remain externally idle for the configured grace period before launch.
 
-## Stale tickets
+## Stale state
 
 Tickets include host, PID, and Linux boot id. On each queue check, stale tickets
 from dead same-host processes or previous boots are removed automatically.
+Running-job records use the same checks and are cleaned by `--status`. New
+records also store the wrapper process start time so a reused PID is not
+mistaken for the original job.
 
 This does **not** resurrect jobs after reboot/disconnect. Run inside `tmux` or
 `screen` if the waiting process must survive SSH disconnects.

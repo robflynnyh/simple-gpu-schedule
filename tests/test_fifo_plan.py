@@ -1,6 +1,9 @@
+import json
+import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from unittest import mock
 
 
 WITH_GPU = SourceFileLoader(
@@ -81,6 +84,87 @@ class CliTests(unittest.TestCase):
 
     def test_all_pool_alias_matches_any(self):
         self.assertEqual(WITH_GPU.parse_pool("all", [0, 1, 2]), [0, 1, 2])
+
+
+class StaleStateTests(unittest.TestCase):
+    def make_record(self, directory, **overrides):
+        path = Path(directory) / "record.json"
+        record = {
+            "host": WITH_GPU.socket.gethostname(),
+            "boot_id": "current-boot",
+            "pid": 123,
+            "pid_start_ticks": 456,
+            "_path": str(path),
+        }
+        record.update(overrides)
+        path.write_text(json.dumps(record))
+        return record, path
+
+    def test_dead_running_record_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record, path = self.make_record(directory)
+            with mock.patch.object(WITH_GPU, "pid_alive", return_value=False):
+                live = WITH_GPU.remove_stale_running(
+                    [record],
+                    "current-boot",
+                )
+
+            self.assertEqual(live, [])
+            self.assertFalse(path.exists())
+
+    def test_reused_pid_running_record_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record, path = self.make_record(directory)
+            with (
+                mock.patch.object(WITH_GPU, "pid_alive", return_value=True),
+                mock.patch.object(
+                    WITH_GPU,
+                    "process_start_ticks",
+                    return_value=999,
+                ),
+            ):
+                live = WITH_GPU.remove_stale_running(
+                    [record],
+                    "current-boot",
+                )
+
+            self.assertEqual(live, [])
+            self.assertFalse(path.exists())
+
+    def test_matching_running_process_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record, path = self.make_record(directory)
+            with (
+                mock.patch.object(WITH_GPU, "pid_alive", return_value=True),
+                mock.patch.object(
+                    WITH_GPU,
+                    "process_start_ticks",
+                    return_value=456,
+                ),
+            ):
+                live = WITH_GPU.remove_stale_running(
+                    [record],
+                    "current-boot",
+                )
+
+            self.assertEqual(live, [record])
+            self.assertTrue(path.exists())
+
+    def test_previous_boot_record_is_removed_without_pid_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record, path = self.make_record(
+                directory,
+                boot_id="old-boot",
+            )
+            with mock.patch.object(WITH_GPU, "pid_alive") as pid_alive:
+                live = WITH_GPU.remove_stale_running(
+                    [record],
+                    "current-boot",
+                )
+
+            self.assertEqual(live, [])
+            self.assertFalse(path.exists())
+            pid_alive.assert_not_called()
 
 
 if __name__ == "__main__":

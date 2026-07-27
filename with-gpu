@@ -196,6 +196,17 @@ def process_info(pid: str) -> tuple[str, str]:
         return "?", ""
 
 
+def process_start_ticks(pid: int) -> int | None:
+    """Return Linux process start ticks, which disambiguate PID reuse."""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        fields_after_comm = stat[stat.rfind(")") + 2 :].split()
+        return int(fields_after_comm[19])
+    except Exception:
+        return None
+
+
 def parse_pool(pool: str, all_indices: list[int]) -> list[int]:
     if pool in ("any", "all"):
         return list(all_indices)
@@ -301,6 +312,7 @@ def create_ticket(paths: dict[str, Path], pool: str, pool_indices: list[int], nu
         "user": os.environ.get("USER", "unknown"),
         "host": socket.gethostname(),
         "pid": os.getpid(),
+        "pid_start_ticks": process_start_ticks(os.getpid()),
         "boot_id": boot_id(),
         "cwd": os.getcwd(),
         "pool": pool,
@@ -348,24 +360,57 @@ def pid_alive(pid: int) -> bool:
         return True
 
 
-def remove_stale_tickets(tickets: list[dict[str, Any]], current_boot_id: str) -> list[dict[str, Any]]:
+def process_record_alive(record: dict[str, Any]) -> bool:
+    try:
+        pid = int(record.get("pid", -1))
+    except (TypeError, ValueError):
+        return False
+    if not pid_alive(pid):
+        return False
+    expected_start = record.get("pid_start_ticks")
+    if expected_start is None:
+        return True
+    try:
+        return process_start_ticks(pid) == int(expected_start)
+    except (TypeError, ValueError):
+        return False
+
+
+def remove_stale_process_records(
+    records: list[dict[str, Any]],
+    current_boot_id: str,
+) -> list[dict[str, Any]]:
     live = []
     host = socket.gethostname()
-    for ticket in tickets:
+    for record in records:
         stale = False
-        if ticket.get("host") == host:
-            if ticket.get("boot_id") != current_boot_id:
+        if record.get("host") == host:
+            if record.get("boot_id") != current_boot_id:
                 stale = True
-            elif not pid_alive(int(ticket.get("pid", -1))):
+            elif not process_record_alive(record):
                 stale = True
         if stale:
             try:
-                Path(ticket["_path"]).unlink(missing_ok=True)
+                Path(record["_path"]).unlink(missing_ok=True)
             except Exception:
                 pass
         else:
-            live.append(ticket)
+            live.append(record)
     return live
+
+
+def remove_stale_tickets(
+    tickets: list[dict[str, Any]],
+    current_boot_id: str,
+) -> list[dict[str, Any]]:
+    return remove_stale_process_records(tickets, current_boot_id)
+
+
+def remove_stale_running(
+    running: list[dict[str, Any]],
+    current_boot_id: str,
+) -> list[dict[str, Any]]:
+    return remove_stale_process_records(running, current_boot_id)
 
 
 def externally_free_indices(gpus: list[dict[str, Any]], idle_since: dict[int, float], idle_seconds: int) -> list[int]:
@@ -645,8 +690,30 @@ def main() -> int:
 
     queue_dir = Path(args.queue_dir)
     if args.status:
-        paths = queue_paths(queue_dir)
-        print(render_queue_check(paths, args.pool, args.num, load_tickets(paths), load_running(paths), gpus))
+        paths = ensure_dirs(queue_dir)
+        qfd = lock_file(paths["locks"] / "queue.lock")
+        try:
+            current_boot_id = boot_id()
+            tickets = remove_stale_tickets(
+                load_tickets(paths),
+                current_boot_id,
+            )
+            running = remove_stale_running(
+                load_running(paths),
+                current_boot_id,
+            )
+        finally:
+            unlock_fd(qfd)
+        print(
+            render_queue_check(
+                paths,
+                args.pool,
+                args.num,
+                tickets,
+                running,
+                gpus,
+            )
+        )
         return 0
 
     paths = ensure_dirs(queue_dir)
